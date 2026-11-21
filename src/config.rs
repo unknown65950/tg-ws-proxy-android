@@ -59,11 +59,38 @@ pub const FRONTING_SNI: &str = "sprinthost.ru";
 
 // proxy/pool.py::_CfWorkerPool
 pub const CF_WORKER_POOL_MAX_AGE: f64 = 100.0;
+pub const CF_WORKER_POOL_CHECK_INTERVAL: f64 = 5.0;
 pub const CF_WORKER_PER_DC_LIMIT: usize = 1;
+pub const CF_WORKER_REFILL_BACKOFF_INITIAL: f64 = 1.0;
+pub const CF_WORKER_REFILL_BACKOFF_MAX: f64 = 3600.0;
 
 // WS пути — proxy/utils.py
 pub const WS_PATH: &str = "/apiws";
 pub const WS_PATH_TEST: &str = "/apiws_test";
+
+// proxy/fake_tls.py — replay-кэш и профиль ServerHello
+pub const TLS_REPLAY_WINDOW: f64 = 241.0;
+pub const TLS_REPLAY_CACHE_SIZE: usize = 65536;
+pub const TLS_CIPHER_PREFERENCE: [u16; 3] = [0x1301, 0x1303, 0x1302];
+pub const TLS_GROUP_X25519: u16 = 0x001d;
+pub const TLS_GROUP_X25519MLKEM768: u16 = 0x11ec;
+pub const TLS_X25519MLKEM768_CLIENT_SHARE_LEN: usize = 1216;
+pub const TLS_MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+pub const TLS_APPDATA_MIN: usize = 64;
+pub const TLS_APPDATA_MAX: usize = 16384;
+pub const TLS_FALLBACK_APPDATA_MIN: usize = 64;
+pub const TLS_FALLBACK_APPDATA_MAX: usize = 160;
+pub const TLS_SERVER_HELLO_DELAY_MS: (u64, u64) = (8, 24);
+pub const TLS_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// proxy/tg_ws_proxy.py — ограниченный drain плохого handshake
+pub const BAD_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BAD_HANDSHAKE_DRAIN_LIMIT: usize = 64 * 1024;
+
+/// Размер первого зашифрованного record'а маскирующего сайта,
+/// измеренный профилировщиком (None — случайный размер 64..160).
+pub static PROFILED_APPDATA_LEN: Lazy<RwLock<Option<usize>>> =
+    Lazy::new(|| RwLock::new(None));
 
 pub const CFPROXY_CACHE_FILE_NAME: &str = "cfproxy-domains-cache.txt";
 pub const CFPROXY_ACTIVE_FILE_NAME: &str = "cfproxy-active-domain.txt";
@@ -310,6 +337,7 @@ pub fn is_reserved_start(s: &[u8]) -> bool {
     s4 == b"HEAD"
         || s4 == b"POST"
         || s4 == b"GET "
+        || s4 == b"OPTI"
         || s4 == [0xee, 0xee, 0xee, 0xee]
         || s4 == [0xdd, 0xdd, 0xdd, 0xdd]
         || s4 == [0x16, 0x03, 0x01, 0x02]

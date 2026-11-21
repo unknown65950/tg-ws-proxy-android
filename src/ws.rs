@@ -327,12 +327,12 @@ impl RawWebSocket {
     }
 
     pub async fn close(&self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            return;
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            // Best-effort close frame.
+            let frame = build_frame(OP_CLOSE, &[], true);
+            let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
         }
-        // Best-effort close frame + shutdown транспорта.
-        let frame = build_frame(OP_CLOSE, &[], true);
-        let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
+        // Транспорт закрывается всегда, даже если close() вызван повторно.
         let mut writer = self.writer.lock().await;
         let _ = shutdown_match(&mut writer).await;
     }
@@ -765,6 +765,20 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
+fn debug_ws_setup_failure(
+    host: &str,
+    port: u16,
+    stage: &str,
+    local: &str,
+    remote: &str,
+    err: &WsError,
+) {
+    ldebug!(
+        "WS setup failed: host={} port={} stage={} local={} remote={} error={}",
+        host, port, stage, local, remote, err.compact()
+    );
+}
+
 // wsConnectOnce — заголовки 1-в-1 как в Python raw_websocket.py (без User-Agent).
 pub async fn ws_connect_once(
     dial_addr: &str,
@@ -794,16 +808,45 @@ pub async fn ws_connect_once_full(
         format!("{}:80", dial_addr)
     };
 
+    let port = if secure { 443u16 } else { 80u16 };
     let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
         Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(WsError::Io(e)),
-        Err(_) => return Err(WsError::Timeout),
+        Ok(Err(e)) => {
+            let text = e.to_string().to_lowercase();
+            let stage = if text.contains("lookup") || text.contains("name or service") {
+                "dns"
+            } else {
+                "tcp"
+            };
+            let err = WsError::Io(e);
+            debug_ws_setup_failure(dial_addr, port, stage, "-", "-", &err);
+            return Err(err);
+        }
+        Err(_) => {
+            let err = WsError::Timeout;
+            debug_ws_setup_failure(dial_addr, port, "tcp", "-", "-", &err);
+            return Err(err);
+        }
     };
     set_sock_opts(&raw_conn);
+    let local = raw_conn
+        .local_addr()
+        .ok()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let remote = raw_conn
+        .peer_addr()
+        .ok()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);
-        return handshake_plain(read_half, write_half, domain, path, timeout).await;
+        let result = handshake_plain(read_half, write_half, domain, path, timeout).await;
+        if let Err(ref err) = result {
+            debug_ws_setup_failure(dial_addr, port, "ws_upgrade", &local, &remote, err);
+        }
+        return result;
     }
 
     let sni_name = sni.unwrap_or(domain);
@@ -821,19 +864,23 @@ pub async fn ws_connect_once_full(
         match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
-                }
-                return Err(WsError::Io(e));
+                let err = WsError::Io(e);
+                debug_ws_setup_failure(dial_addr, port, "tcp/tls", &local, &remote, &err);
+                return Err(err);
             }
             Err(_) => {
-                ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
-                return Err(WsError::Timeout);
+                let err = WsError::Timeout;
+                debug_ws_setup_failure(dial_addr, port, "tcp/tls", &local, &remote, &err);
+                return Err(err);
             }
         };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
-    handshake_tls(read_half, write_half, domain, path, timeout).await
+    let result = handshake_tls(read_half, write_half, domain, path, timeout).await;
+    if let Err(ref err) = result {
+        debug_ws_setup_failure(dial_addr, port, "ws_upgrade", &local, &remote, err);
+    }
+    result
 }
 
 // wsConnect: пытается ip, при необходимости резолвит DoH

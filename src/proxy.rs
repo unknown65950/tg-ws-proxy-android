@@ -524,6 +524,11 @@ pub struct CfWorkerEntry {
 pub struct CfWorkerPool {
     idle: Mutex<HashMap<i32, VecDeque<CfWorkerEntry>>>,
     refilling: Mutex<HashSet<i32>>,
+    rotating: Mutex<HashSet<i32>>,
+    refill_failures: Mutex<HashMap<i32, u32>>,
+    refill_after: Mutex<HashMap<i32, f64>>,
+    refill_tasks: Mutex<HashMap<i32, tokio::task::JoinHandle<()>>>,
+    rotate_tasks: Mutex<HashMap<i32, tokio::task::JoinHandle<()>>>,
     exhausted_until: Mutex<HashMap<String, f64>>,
     cancel_token: CancellationToken,
 }
@@ -533,9 +538,20 @@ impl CfWorkerPool {
         CfWorkerPool {
             idle: Mutex::new(HashMap::new()),
             refilling: Mutex::new(HashSet::new()),
+            rotating: Mutex::new(HashSet::new()),
+            refill_failures: Mutex::new(HashMap::new()),
+            refill_after: Mutex::new(HashMap::new()),
+            refill_tasks: Mutex::new(HashMap::new()),
+            rotate_tasks: Mutex::new(HashMap::new()),
             exhausted_until: Mutex::new(HashMap::new()),
             cancel_token,
         }
+    }
+
+    fn is_stale(entry: &CfWorkerEntry, now: f64) -> bool {
+        now - entry.created >= CF_WORKER_POOL_MAX_AGE
+            || entry.ws.is_closed()
+            || entry.ws.transport_closing()
     }
 
     pub async fn get(
@@ -544,13 +560,16 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) -> Option<(RawWebSocket, String)> {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty() {
+            return None;
+        }
         let now = now_monotonic();
         let entry = {
             let mut map = self.idle.lock().await;
             let bucket = map.entry(dc).or_insert_with(VecDeque::new);
             let mut hit = None;
             while let Some(e) = bucket.pop_front() {
-                if now - e.created > CF_WORKER_POOL_MAX_AGE || e.ws.is_closed() {
+                if Self::is_stale(&e, now) {
                     let ws = e.ws;
                     tokio::spawn(async move {
                         ws.close().await;
@@ -571,26 +590,193 @@ impl CfWorkerPool {
                     e.worker_domain,
                     now - e.created
                 );
-                self.schedule_refill(dc, fallback_dst, worker_domains).await;
                 Some((e.ws, e.worker_domain))
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
+                self.schedule_refill(dc, fallback_dst, worker_domains).await;
                 None
             }
         }
     }
 
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+    async fn schedule_refill(
+        self: &Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty() {
+            return;
+        }
+        self.schedule_rotation(dc, fallback_dst.clone(), worker_domains.clone())
+            .await;
+
+        if now_monotonic() < self.refill_after.lock().await.get(&dc).copied().unwrap_or(0.0) {
+            return;
+        }
         {
             let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
+            if !r.insert(dc) {
                 return;
             }
-            r.insert(dc);
         }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
+        let handle = spawn_cf_refill_task(self.clone(), dc, fallback_dst, worker_domains);
+        self.refill_tasks.lock().await.insert(dc, handle);
+    }
+
+    async fn refill(
+        self: Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        let target = CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize);
+        let cur = self.idle.lock().await.get(&dc).map(|b| b.len()).unwrap_or(0);
+        if target == 0 || cur >= target {
+            self.refilling.lock().await.remove(&dc);
+            return;
+        }
+
+        let mut connected = 0usize;
+        for _ in 0..(target - cur) {
+            let result = tokio::select! {
+                _ = self.cancel_token.cancelled() => None,
+                r = self.connect_one(worker_domains.clone(), fallback_dst.clone(), dc) => r,
+            };
+            if !self.refilling.lock().await.contains(&dc) {
+                if let Some((ws, _)) = result {
+                    tokio::spawn(async move {
+                        ws.close().await;
+                    });
+                }
+                return;
+            }
+            match result {
+                Some((ws, domain)) => {
+                    let mut map = self.idle.lock().await;
+                    map.entry(dc)
+                        .or_insert_with(VecDeque::new)
+                        .push_back(CfWorkerEntry {
+                            ws,
+                            created: now_monotonic(),
+                            worker_domain: domain,
+                        });
+                    connected += 1;
+                }
+                None => break,
+            }
+        }
+
+        if connected > 0 {
+            self.refill_failures.lock().await.remove(&dc);
+            self.refill_after.lock().await.remove(&dc);
+        } else {
+            let mut failures = self.refill_failures.lock().await;
+            let count = failures.get(&dc).copied().unwrap_or(0) + 1;
+            *failures.entry(dc).or_insert(0) = count;
+            let shift = (count - 1).min(12);
+            let delay = (CF_WORKER_REFILL_BACKOFF_INITIAL * (2u64.pow(shift) as f64))
+                .min(CF_WORKER_REFILL_BACKOFF_MAX);
+            drop(failures);
+            self.refill_after
+                .lock()
+                .await
+                .insert(dc, now_monotonic() + delay);
+            linfo!(
+                "CF worker pool refill failed for DC{}, retry in {:.0}s",
+                dc, delay
+            );
+        }
+        ldebug!("CF worker pool refilled DC{}: {} ready", dc, connected);
+        self.refilling.lock().await.remove(&dc);
+    }
+
+    async fn schedule_rotation(
+        self: &Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        {
+            let mut rotating = self.rotating.lock().await;
+            if !rotating.insert(dc) {
+                return;
+            }
+        }
+        let handle = spawn_cf_rotate_task(self.clone(), dc, fallback_dst, worker_domains);
+        self.rotate_tasks.lock().await.insert(dc, handle);
+    }
+
+    async fn rotate(
+        self: Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        loop {
+            if POOL_SIZE.load(Ordering::Relaxed) <= 0 {
+                break;
+            }
+            let sleep_dur = {
+                let now = now_monotonic();
+                let map = self.idle.lock().await;
+                let mut wake_at = now + CF_WORKER_POOL_CHECK_INTERVAL;
+                if let Some(bucket) = map.get(&dc) {
+                    let min_expiry = bucket
+                        .iter()
+                        .map(|e| e.created + CF_WORKER_POOL_MAX_AGE)
+                        .fold(f64::INFINITY, f64::min);
+                    if min_expiry.is_finite() {
+                        wake_at = wake_at.min(min_expiry);
+                    }
+                }
+                let after = self.refill_after.lock().await.get(&dc).copied().unwrap_or(0.0);
+                if after > now {
+                    wake_at = wake_at.min(after);
+                }
+                (wake_at - now).clamp(0.0, CF_WORKER_POOL_CHECK_INTERVAL)
+            };
+            tokio::select! {
+                _ = self.cancel_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs_f64(sleep_dur)) => {}
+            }
+
+            let now = now_monotonic();
+            let (expired, ready_count) = {
+                let mut map = self.idle.lock().await;
+                let bucket = map.entry(dc).or_insert_with(VecDeque::new);
+                let mut ready = VecDeque::with_capacity(bucket.len());
+                let mut expired = Vec::new();
+                while let Some(e) = bucket.pop_front() {
+                    if Self::is_stale(&e, now) {
+                        expired.push(e.ws);
+                    } else {
+                        ready.push_back(e);
+                    }
+                }
+                *bucket = ready;
+                (expired, bucket.len())
+            };
+            let expired_count = expired.len();
+            for ws in expired {
+                tokio::spawn(async move {
+                    ws.close().await;
+                });
+            }
+            if expired_count > 0 {
+                ldebug!(
+                    "CF worker pool rotated DC{}: {} stale, {} ready",
+                    dc, expired_count, ready_count
+                );
+            }
+            let target = CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize);
+            if ready_count < target {
+                self.schedule_refill(dc, fallback_dst.clone(), worker_domains.clone())
+                    .await;
+            }
+        }
+        self.rotating.lock().await.remove(&dc);
     }
 
     pub async fn refill_now(
@@ -599,46 +785,7 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) {
-        let should = {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                false
-            } else {
-                r.insert(dc);
-                true
-            }
-        };
-        if !should {
-            return;
-        }
-        let pool = self.clone();
-        let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
-            let _cancel = cancel;
-            {
-                let map = pool.idle.lock().await;
-                let cur = map.get(&dc).map(|b| b.len()).unwrap_or(0);
-                if cur >= CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize) {
-                    pool.refilling.lock().await.remove(&dc);
-                    return;
-                }
-            }
-            if let Some((ws, domain)) = pool
-                .connect_one(worker_domains.clone(), fallback_dst.clone(), dc)
-                .await
-            {
-                let mut map = pool.idle.lock().await;
-                map.entry(dc)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(CfWorkerEntry {
-                        ws,
-                        created: now_monotonic(),
-                        worker_domain: domain,
-                    });
-                ldebug!("CF worker pool refilled DC{}: ready", dc);
-            }
-            pool.refilling.lock().await.remove(&dc);
-        });
+        self.schedule_refill(dc, fallback_dst, worker_domains).await;
     }
 
     async fn connect_one(
@@ -656,6 +803,13 @@ impl CfWorkerPool {
             {
                 Ok(ws) => return Some((ws, worker_domain)),
                 Err(exc) => {
+                    ldebug!(
+                        "CF worker pool connect DC{} via {} for {} failed: {}",
+                        dc,
+                        worker_domain,
+                        fallback_dst,
+                        exc.compact()
+                    );
                     self.report_failure(&worker_domain, &exc).await;
                 }
             }
@@ -697,7 +851,7 @@ impl CfWorkerPool {
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
         let worker_domains = CF_WORKER_DOMAINS.read().clone();
-        if worker_domains.is_empty() {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty() {
             return;
         }
         // CF worker греем только для DC, которых НЕТ в прямых редиректах.
@@ -717,6 +871,19 @@ impl CfWorkerPool {
     }
 
     pub async fn close_all(&self) {
+        let refill_tasks: Vec<_> = std::mem::take(&mut *self.refill_tasks.lock().await)
+            .into_values()
+            .collect();
+        let rotate_tasks: Vec<_> = std::mem::take(&mut *self.rotate_tasks.lock().await)
+            .into_values()
+            .collect();
+        for h in refill_tasks.iter().chain(rotate_tasks.iter()) {
+            h.abort();
+        }
+        for h in refill_tasks.into_iter().chain(rotate_tasks.into_iter()) {
+            let _ = h.await;
+        }
+
         let mut map = self.idle.lock().await;
         for bucket in map.values_mut() {
             for e in bucket.drain(..) {
@@ -731,8 +898,35 @@ impl CfWorkerPool {
         self.close_all().await;
         self.idle.lock().await.clear();
         self.refilling.lock().await.clear();
+        self.rotating.lock().await.clear();
+        self.refill_failures.lock().await.clear();
+        self.refill_after.lock().await.clear();
         self.exhausted_until.lock().await.clear();
     }
+}
+
+// Синхронные спавн-хелперы (как для WsPool): разрывают рекурсивный цикл
+// future schedule_refill → refill → schedule_rotation → rotate → schedule_refill.
+fn spawn_cf_refill_task(
+    pool: Arc<CfWorkerPool>,
+    dc: i32,
+    fallback_dst: String,
+    worker_domains: Vec<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        pool.refill(dc, fallback_dst, worker_domains).await;
+    })
+}
+
+fn spawn_cf_rotate_task(
+    pool: Arc<CfWorkerPool>,
+    dc: i32,
+    fallback_dst: String,
+    worker_domains: Vec<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        pool.rotate(dc, fallback_dst, worker_domains).await;
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,13 +1427,20 @@ async fn try_cfproxy_base_domain(
         if is_http_status_error(&e, 429) {
             mark_cfproxy_429_cooldown(&base_domain, &e);
         }
+        let port = if DISABLE_SECURE.load(Ordering::Relaxed) { 80 } else { 443 };
         if !resolved_ip.is_empty() {
             log_cf_conn_error(
-                &format!(" CF fail {} via {}: {}", domain, resolved_ip, e.compact()),
+                &format!(
+                    " CF fail {} via {}: {} (host={} port={})",
+                    domain, resolved_ip, e.compact(), domain, port
+                ),
                 &e,
             );
         } else {
-            log_cf_conn_error(&format!(" CF fail {}: {}", domain, e.compact()), &e);
+            log_cf_conn_error(
+                &format!(" CF fail {}: {} (host={} port={})", domain, e.compact(), domain, port),
+                &e,
+            );
         }
         return (None, String::new());
     }
@@ -1411,8 +1612,9 @@ where
                     Err(exc) => {
                         pools.cf_worker.report_failure(&worker_domain, &exc).await;
                         lwarn!(
-                            "[{}] DC{}{} CF worker {} failed: {}",
-                            label, dc, m_tag, worker_domain, exc.compact()
+                            "[{}] DC{}{} CF worker {} failed: {} (host={} port={})",
+                            label, dc, m_tag, worker_domain, exc.compact(),
+                            worker_domain, secure_port
                         );
                     }
                 }
@@ -1530,6 +1732,20 @@ async fn read_proxy_protocol_line(conn: &mut TcpStream) -> Option<String> {
     match res {
         Ok(Ok(())) => Some(String::from_utf8_lossy(&line).to_string()),
         _ => None,
+    }
+}
+
+/// Ограниченный drain плохого handshake: не даём prober'у удерживать
+/// соединение, читая бесконечный поток (proxy/tg_ws_proxy.py::_drain_bad_handshake).
+async fn drain_bad_handshake<R: AsyncReadExt + Unpin>(reader: &mut R) {
+    let mut remaining = BAD_HANDSHAKE_DRAIN_LIMIT;
+    let mut buf = [0u8; 4096];
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        match reader.read(&mut buf[..want]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => remaining -= n,
+        }
     }
 }
 
@@ -1684,6 +1900,11 @@ async fn serve_core<R, W>(
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
         lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        let _ = tokio::time::timeout(
+            BAD_HANDSHAKE_DRAIN_TIMEOUT,
+            drain_bad_handshake(&mut conn_read),
+        )
+        .await;
         return;
     }
 

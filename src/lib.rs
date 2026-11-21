@@ -93,6 +93,15 @@ pub unsafe extern "C" fn StartProxy(
     let dc_opt_map: HashMap<i32, String> = parse_cidr_pool(&dc_ips_str);
 
     let rt = runtime();
+
+    // Профиль FakeTLS: замер первого record'а маскирующего сайта идёт в фоне,
+    // чтобы не блокировать JNI-вызов StartProxy.
+    *PROFILED_APPDATA_LEN.write() = None;
+    let probe_domain = FAKE_TLS_DOMAIN.read().clone();
+    if !probe_domain.is_empty() {
+        rt.spawn(faketls::run_profile_probe(probe_domain));
+    }
+
     let cancel_tasks = CancellationToken::new();
     let pools = Arc::new(ProxyPools::new(cancel_tasks.clone()));
 
@@ -171,6 +180,7 @@ pub extern "C" fn StopProxy() -> c_int {
     });
 
     STATS.reset();
+    *PROFILED_APPDATA_LEN.write() = None;
     WS_BLACKLIST.write().clear();
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
